@@ -1,0 +1,970 @@
+---
+editor_options:
+  markdown:
+    wrap: 72
+output: pdf_document
+---
+
+Showcase of the bioinformatics analyses made so far.
+
+```{r, message=FALSE}
+library(clusterProfiler)
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+library(tidyverse, readxl)
+library(biomaRt)
+```
+
+# Load and Wrangle
+
+## Metadata
+
+```{r}
+meta <- read.delim("OSD-571_metadata_OSD-571-ISA/a_OSD-571_transcription-profiling_rna-sequencing-(rna-seq)_Illumina.txt")
+meta <- meta %>%
+  dplyr::select(`Sample.Name`) %>%
+  separate_wider_delim(`Sample.Name`, 
+                       delim = "_", 
+                       names = c('sample','plasma','time','assay','rep'), 
+                       too_few = 'align_start',
+                       cols_remove=F)
+```
+
+## EV sequencing Count Matrices (OSD-571)
+
+Load the matrices coming from OSD-571 (Exosomal cfRNA sequencing)
+
+```{r, eval=F}
+ev_feature_counts <- read_tsv("cfrna_counts_ensmbl_passQC.tsv") %>%
+  rename_with(sub, pattern='nasa_cfrna_', replacement='')
+
+# Previous run on Galaxy generated data (from raw .fastq reads)
+  #ev_feature_counts <- read_tsv("kallisto_matrix.csv") %>%
+  #  separate_wider_delim(cols = "target_id", delim = "|", names = c('ensembl_transcript_id', "ensembl_gene_id", "gene_id", "trans_id", "gene_code", "symbol", #"entrezid", "annotation", "_")) %>%
+  #  dplyr::select(-"_")
+  #ev_feature_counts_lnc <- filter(ev_feature_counts, `annotation`=="lncRNA")
+
+ev_feature_counts
+```
+
+## Whole Blood data (OSD-569)
+
+Load Whole Blood Nanopore long read direct-RNAseq (coming from OSD-569
+dataset GLDS-561). Wrangle to only recover the DESeq2 results.
+
+The dataset was articulated in three different comparisons,
+
+-   **short term**: ((R+1) vs (L-92, L-44, L-3))
+
+-   **average**: ((R+1, R+45, R+84) vs (L-92, L-44, L-3))
+
+-   **long term**: ((R+84) vs (L-92, L-44, L-3))
+
+```{r load_osd569, warning=F}
+library(readxl)
+wb_short_term <- read_xlsx("../OSD-569/GLDS-561_nanoporeRNAseq_Direct_RNA_seq_Gene_Expression_Processed.xlsx", 
+                           skip = 6, 
+                           sheet = 1) %>%
+  dplyr::rename('id' = "...1") %>%
+  dplyr::select(c('id', starts_with("I4"))) %>%
+  mutate(id = sub("\\..*", "", id))
+
+colnames(wb_short_term) <- c('ensembl_id', paste(wb_short_term[1, 2:ncol(wb_short_term)], 
+                                                 wb_short_term[2, 2:ncol(wb_short_term)], 
+                                                 sep="_"))
+wb_short_term <- wb_short_term[4:nrow(wb_short_term),]
+wb_short_term[,2:ncol(wb_short_term)] <- lapply(wb_short_term[,2:ncol(wb_short_term)], as.numeric)
+
+wb_average <- read_xlsx("../OSD-569/GLDS-561_nanoporeRNAseq_Direct_RNA_seq_Gene_Expression_Processed.xlsx", 
+                        skip = 6, 
+                        sheet = 2) %>%
+  dplyr::rename('id' = '...1') %>%
+  dplyr::select(c('id', starts_with("I4"))) %>%
+  mutate(id = sub("\\..*", "", id))
+
+colnames(wb_average) <- c('ensembl_id', paste(wb_average[1, 2:ncol(wb_average)], 
+                                                 wb_average[2, 2:ncol(wb_average)], 
+                                                 sep="_"))
+wb_average <- wb_average[4:nrow(wb_average),]
+wb_average[,2:ncol(wb_average)] <- lapply(wb_average[,2:ncol(wb_average)], as.numeric)
+
+wb_long_term <- read_xlsx("../OSD-569/GLDS-561_nanoporeRNAseq_Direct_RNA_seq_Gene_Expression_Processed.xlsx", 
+                          skip = 6, 
+                          sheet = 10) %>%
+  dplyr::rename('id' = '...1') %>%
+  dplyr::select(c('id', starts_with("I4"))) %>%
+  mutate(id = sub("\\..*", "", id))
+
+colnames(wb_long_term) <- c('ensembl_id', paste(wb_long_term[1, 2:ncol(wb_long_term)], 
+                                                 wb_long_term[2, 2:ncol(wb_long_term)], 
+                                                 sep="_"))
+wb_long_term <- wb_long_term[4:nrow(wb_long_term),]
+wb_long_term[,2:ncol(wb_long_term)] <- lapply(wb_long_term[,2:ncol(wb_long_term)], as.numeric)
+
+```
+
+## Prepare WholeBlood feature count matrix
+
+Wrangling OSD-569 to isolate the feature counts from the DESeq2 outputs.
+Useful to make a custom DESeq2 run (returnVSreturn which was not done
+originally)
+
+```{r}
+wholeblood <- read_xlsx("../OSD-569/GLDS-561_nanoporeRNAseq_Direct_RNA_seq_Gene_Expression_Processed.xlsx", skip = 6, sheet = 2)
+
+wb_feature_counts <- wholeblood %>%
+  dplyr::rename('ensembl_id' = '...1') %>%
+  dplyr::select(c('ensembl_id', starts_with("featureCounts")))
+
+colnames(wb_feature_counts) <- c('ensembl_id', 
+                                 paste(wb_feature_counts[1, 2:ncol(wb_feature_counts)], 
+                                       wb_feature_counts[2, 2:ncol(wb_feature_counts)], 
+                                       sep="_"))
+
+wb_feature_counts <- dplyr::slice(wb_feature_counts , -1,-2,-3)
+```
+
+# DE lncRNA Retrieval
+
+## Load lncRNAs
+
+Load a full list of annotated lncRNAs from multiple sources (lnciPedia).
+This is assumed as a masterlist and may be further extended with other
+trusted sources.
+
+```{r, echo = F}
+linclist <- read_delim("../OSD-530/symbol2ENSEMBL_lncpedia_list.txt", delim = "\t")
+
+unique_ensemblGeneID <- unique(sub("\\..*", "", linclist$ensemblGeneID))
+linclist <- linclist %>%
+  mutate(ensemblGeneID = sub("\\..*", "", linclist$ensemblGeneID)) %>%
+  filter(ensemblGeneID %in% unique_ensemblGeneID)
+rm(unique_ensemblGeneID)
+
+sum(is.na(linclist$ensemblGeneID))
+```
+
+Filter the WholeBlood Differential Expression results for genes present
+in lncPedia (namely retrieve all annotated and predicted lncRNAs and see
+their DE)
+
+```{r lnc_filtering}
+wb_short_term_lnc <- wb_short_term %>%
+  filter(ensembl_id %in% linclist$ensemblGeneID)
+wb_average_lnc <- wb_average %>%
+  filter(ensembl_id %in% linclist$ensemblGeneID)
+wb_long_term_lnc <- wb_long_term %>%
+  filter(ensembl_id %in% linclist$ensemblGeneID)
+```
+
+### Volcano Plot of the DE
+
+Make a volcano plot, visualizing any lncRNAs. The parameters used so far
+and plotted are the results of the standard Differential Expression
+pipeline in use in NASA GeneLab - details available on the official
+GitHub page. DESeq2 results were not as informative.
+
+```{r volcano plots}
+
+# ggplot(wb_short_term, aes(x=as.numeric(DESeq2_log2FC), y=-log10(as.numeric(`DESeq2_p-value`)))) +
+#   geom_point() +
+#   geom_vline(xintercept = c(-1, 1), linetype="dashed", color="red") +
+#   geom_hline(yintercept = -log10(0.05), linetype="dashed", color="red") +
+#   labs(title="Volcano Plot for wb_short_term", x="log2(Fold Change)", y="-log10(P-value)")
+
+log2fc_threshold <- 1
+pvalue_threshold <- 0.05
+
+plot_volcano <- function(wb_short_term, wb_short_term_lnc, title){
+  
+  p <- ggplot(wb_short_term, aes(x=as.numeric(`pipeline-transcriptome-de_log2FC`), y=-log10(as.numeric(`pipeline-transcriptome-de_p-value`)))) +
+    geom_point(shape = ifelse(wb_short_term$ensembl_id %in% wb_short_term_lnc$ensembl_id, 19, 1),
+               alpha= ifelse(wb_short_term$ensembl_id %in% wb_short_term_lnc$ensembl_id &
+                               wb_short_term$`pipeline-transcriptome-de_p-value` <= pvalue_threshold &
+                               (wb_short_term$`pipeline-transcriptome-de_log2FC` < -log2fc_threshold |
+                               wb_short_term$`pipeline-transcriptome-de_log2FC` > log2fc_threshold), 1, 0.5),
+               colour = ifelse(wb_short_term$ensembl_id %in% wb_short_term_lnc$ensembl_id & 
+                                 wb_short_term$`pipeline-transcriptome-de_p-value` <= pvalue_threshold & 
+                                 wb_short_term$`pipeline-transcriptome-de_log2FC` > log2fc_threshold, 
+                               "red",
+                               ifelse(wb_short_term$ensembl_id %in% wb_short_term_lnc$ensembl_id & 
+                                        wb_short_term$`pipeline-transcriptome-de_p-value` <= pvalue_threshold &
+                                        wb_short_term$`pipeline-transcriptome-de_log2FC` < -log2fc_threshold, 
+                                      "darkcyan", 
+                                      "black")),
+               size = ifelse(wb_short_term$ensembl_id %in% wb_short_term_lnc$ensembl_id & 
+                               wb_short_term$`pipeline-transcriptome-de_p-value` <= pvalue_threshold &
+                               (wb_short_term$`pipeline-transcriptome-de_log2FC` < -log2fc_threshold | 
+                               wb_short_term$`pipeline-transcriptome-de_log2FC` > log2fc_threshold), 3, 1)) +
+    geom_vline(xintercept = c(-log2fc_threshold, log2fc_threshold), linetype="dashed", color="red") +
+    geom_hline(yintercept = -log10(pvalue_threshold), linetype="dashed", color="red") +
+    ylim(0, 10) +
+    xlim(-5,5) +
+    labs(title=title, 
+         x="log2(Fold Change)", 
+         y="-log10(P-value)") +
+    scale_color_manual(labels = c('Upregulated DE lncRNAs', 'Downregulated DE lncRNAs'))
+  
+  show(p)
+  
+  print('number of upregulated lncRNAs')
+  wb_short_term %>% filter(wb_short_term$ensembl_id %in% wb_short_term_lnc$ensembl_id,
+                            wb_short_term$`pipeline-transcriptome-de_p-value` <= pvalue_threshold,
+                            wb_short_term$`pipeline-transcriptome-de_log2FC` > log2fc_threshold) %>%
+    nrow() %>%
+    print()
+  
+  print('number of downregulated lncRNAs')
+  wb_short_term %>% filter(wb_short_term$ensembl_id %in% wb_short_term_lnc$ensembl_id,
+                            wb_short_term$`pipeline-transcriptome-de_p-value` <= pvalue_threshold,
+                            wb_short_term$`pipeline-transcriptome-de_log2FC` < -log2fc_threshold) %>%
+    nrow() %>%
+    print()
+}
+
+
+print('ShortTerm comparison')
+plot_volcano(wb_short_term, wb_short_term_lnc, 'DE lncRNAs in ShortTerm')
+print('Average comparison')
+plot_volcano(wb_average, wb_average_lnc, 'DE lncRNAs in Average')
+print('LongTerm comparison')
+plot_volcano(wb_long_term, wb_long_term_lnc, 'DE lncRNAs in LongTerm')
+```
+
+### Retrieve DE lncRNA lists
+
+Group the lncRNAs retrieved as such, subsetting the list for the most
+significantly enriched (upregulated and downregulated)
+
+```{r}
+wb_short_term_lnc %>% filter(`pipeline-transcriptome-de_log2FC` > 1 | `pipeline-transcriptome-de_log2FC` < -1) %>%
+  pull(., `pipeline-transcriptome-de_p-value`) %>%
+  sort() %>%
+  plot() +
+  abline(h = 0.05, col='red')
+
+wb_short_term_lnc_up <- wb_short_term_lnc %>% 
+  filter(`pipeline-transcriptome-de_log2FC` > 1 & `pipeline-transcriptome-de_p-value`<0.1) %>%
+  pull(., ensembl_id)
+
+wb_short_term_lnc_down <- wb_short_term_lnc  %>% 
+  filter(`pipeline-transcriptome-de_log2FC` < -1 & `pipeline-transcriptome-de_p-value`<0.1) %>%
+  pull(., ensembl_id)
+
+
+wb_average_lnc %>% filter(`pipeline-transcriptome-de_log2FC` > 1 | `pipeline-transcriptome-de_log2FC` < -1) %>%
+  pull(., `pipeline-transcriptome-de_p-value`) %>%
+  sort() %>%
+  plot()
+  abline(h = 0.05, col='red')
+
+wb_average_lnc_up <- wb_average_lnc %>% 
+  filter(`pipeline-transcriptome-de_log2FC` > 1 & `pipeline-transcriptome-de_p-value`<0.1) %>%
+  pull(., ensembl_id)
+
+wb_average_lnc_down <- wb_average_lnc  %>% 
+  filter(`pipeline-transcriptome-de_log2FC` < -1 & `pipeline-transcriptome-de_p-value`<0.1) %>%
+  pull(., ensembl_id)
+
+
+wb_long_term_lnc %>% filter(`pipeline-transcriptome-de_log2FC` > 1 | `pipeline-transcriptome-de_log2FC` < -1) %>%
+  pull(., `pipeline-transcriptome-de_p-value`) %>%
+  sort() %>%
+  plot()
+  abline(h = 0.05, col='red')
+
+wb_long_term_lnc_up <- wb_long_term_lnc %>% 
+  filter(`pipeline-transcriptome-de_log2FC` > 1 & `pipeline-transcriptome-de_p-value`<0.1) %>%
+  pull(., ensembl_id)
+
+wb_long_term_lnc_down <- wb_long_term_lnc  %>% 
+  filter(`pipeline-transcriptome-de_log2FC` < -1 & `pipeline-transcriptome-de_p-value`<0.1) %>%
+  pull(., ensembl_id)
+```
+
+Rank the list of differentially expressed lncRNAs and pick the top 5
+upregulated genes and the top 5 downregulated genes (p-val \< 0.05).
+
+```{r define_top10lists}
+top_2n_list <- function(wb_delnc, linclist, n){
+  wb_delnc <- filter(wb_delnc, 
+                     `pipeline-transcriptome-de_p-value`<0.05) %>%#, 
+  #                   `pipeline-transcriptome-de_log2FC`>1 | `pipeline-transcriptome-de_log2FC`< -1) %>%
+    arrange(`pipeline-transcriptome-de_p-value`) %>%
+    mutate(ensembl_id = sub("\\..*", "", ensembl_id),
+           direction = ifelse(`pipeline-transcriptome-de_log2FC` > 1, 'up', 'down')) %>%
+    dplyr::filter(ensembl_id %in% linclist$ensemblGeneID) %>%
+    distinct()
+  
+  wb_delnc_down <- wb_delnc %>%
+    arrange(`pipeline-transcriptome-de_log2FC`) %>%
+    slice_head(n = n)
+  
+  wb_delnc_up <- wb_delnc %>%
+    arrange(-`pipeline-transcriptome-de_log2FC`) %>%
+    slice_head(n = n)
+  
+  wb_delnc_combined <- rbind(wb_delnc_up, wb_delnc_down)
+  
+  return(wb_delnc_combined)
+}
+
+top10list_short_term <- top_2n_list(wb_short_term, linclist, 5)
+top10list_long_term <- top_2n_list(wb_long_term, linclist, 5)
+top10list_average <- top_2n_list(wb_average, linclist, 5)
+
+# write_csv(top10list_short_term, file = "top10list_short_term.csv")
+# write_csv(top10list_long_term, file = "top10list_long_term.csv")
+# write_csv(top10list_average, file = "top10list_average.csv")
+```
+
+# Time-Series analysis
+
+Attempt to visualize the change of expression of specific lncRNAs that
+were found to be differentially expressed, in order to examine the
+change across single timestamps and derive another putative panel of
+biomarkers.
+
+Normalize counts from the Wholeblood dataset with DESeq2 for plotting.
+
+```{r normalize_wb_counts, message=F }
+library(DESeq2)
+
+counts <- wb_feature_counts %>%
+  distinct(ensembl_id, .keep_all = TRUE) %>%
+  column_to_rownames(var = 'ensembl_id') %>%
+  mutate_all(as.numeric)
+# counts <- select(counts, -ensembl_id)
+
+coldata <- data.frame(condition = gsub(".*_([A-Za-z]).*", "\\1", names(counts)),
+                     row.names = names(counts)
+                     )
+
+deseqdf <- DESeq2::DESeqDataSetFromMatrix(countData = counts,
+                                          colData = coldata,
+                                          design = ~ condition)
+
+# plotPCA(DESeq2::vst(deseqdf)) +
+#   ylim(c(-25,25)) +
+#   theme(legend.position = "bottom")
+
+deseqdf <- estimateSizeFactors(deseqdf)
+wb_norm_feature_counts <- counts(deseqdf, normalized=T) %>%
+  as.data.frame() %>%
+  rownames_to_column(var = 'ensembl_id')
+# rm(deseqdf, coldata, counts)
+```
+
+Retrieve the 
+```{r wrangle_feature_counts}
+wb_de <- wholeblood %>%
+  dplyr::rename('ensembl_id' = '...1') %>%
+  dplyr::select(c('ensembl_id', starts_with("I4")))
+
+
+colnames(wb_de) <- c('ensembl_id', 
+                                 paste(wb_de[1, 2:ncol(wb_de)], 
+                                       wb_de[2, 2:ncol(wb_de)], 
+                                       sep="_"))
+
+wb_de <- dplyr::slice(wb_de , -1,-2,-3) %>%
+  dplyr::mutate(mutate(across(-1, as.numeric)))
+
+wb_de <- filter(wb_de, 
+                   `pipeline-transcriptome-de_p-value`<0.1) %>%#, 
+#                   `pipeline-transcriptome-de_log2FC`>1 | `pipeline-transcriptome-de_log2FC`< -1) %>%
+  arrange(`pipeline-transcriptome-de_p-value`) %>%
+  mutate(ensembl_id = sub("\\..*", "", ensembl_id),
+         direction = ifelse(`pipeline-transcriptome-de_log2FC` > 1, 'up', 'down'))
+  
+wb_delnc <- dplyr::filter(wb_de, ensembl_id %in% linclist$ensemblGeneID) %>%
+  distinct()
+
+wb_delnc_down <- wb_delnc %>%
+  arrange(`pipeline-transcriptome-de_log2FC`) %>%
+  slice_head(n = 5)
+
+wb_delnc_up <- wb_delnc %>%
+  arrange(-`pipeline-transcriptome-de_log2FC`) %>%
+  slice_head(n = 5)
+
+wb_delnc_combined <- rbind(wb_delnc_up, wb_delnc_down)
+
+rm(wholeblood)
+```
+
+Build a dataset with the normalized counts to display the expression
+change across experiment time.
+
+```{r create_timeseries_df}
+timeseries <- data.frame(
+  'ensembl_id' = wb_norm_feature_counts$ensembl_id,
+  "Preflight_3" = rowMeans(sapply(dplyr::select(wb_norm_feature_counts, ends_with("L-3")), as.numeric)),
+  "Preflight_44" = rowMeans(sapply(dplyr::select(wb_norm_feature_counts, ends_with("L-44")), as.numeric)),
+  "Preflight_92" = rowMeans(sapply(dplyr::select(wb_norm_feature_counts, ends_with("L-92")), as.numeric)),
+  "Postflight_1" = rowMeans(sapply(dplyr::select(wb_norm_feature_counts, ends_with("R+1")), as.numeric)),
+  "Postflight_45" = rowMeans(sapply(dplyr::select(wb_norm_feature_counts, ends_with("R+45")), as.numeric)),
+  "Postflight_82" = rowMeans(sapply(dplyr::select(wb_norm_feature_counts, ends_with("R+82")), as.numeric))) %>%
+  dplyr::mutate(ensembl_id = sub("\\..*", "", ensembl_id)) %>%
+  dplyr::distinct() %>%
+  pivot_longer(cols = -ensembl_id, names_to = "time", values_to = "expression") %>%
+  dplyr::mutate(
+    time = factor(time, 
+                  levels = c("Preflight_92", "Preflight_44", "Preflight_3", "Postflight_1", "Postflight_45", "Postflight_82")))
+
+timeseries <- timeseries %>%
+    mutate(
+    SYMBOL = mapIds(
+      org.Hs.eg.db, 
+      keys = ensembl_id,
+      column = "SYMBOL", 
+      keytype = "ENSEMBL", 
+      multiVals = "first")) %>%
+  #dplyr::left_join(bitr(timeseries$ensembl_id,fromType = "ENSEMBL",toType = "SYMBOL",OrgDb = "org.Hs.eg.db"),by = c("ensembl_id" = "ENSEMBL")) %>%
+  dplyr::left_join(
+    dplyr::select(
+      wb_de,
+      ensembl_id,
+      # direction,
+      `pipeline-transcriptome-de_log2FC`,
+      `pipeline-transcriptome-de_p-value`),
+    by = "ensembl_id")
+```
+
+Plot the normalized counts across the top 10 deregulated lncRNAs.
+
+```{r plot_feature_counts}
+library(patchwork)
+top_genes_plot <- function(timeseries, top10lnclist, plot_title, y_limits){
+  
+  p <- timeseries %>%
+  filter(ensembl_id %in% top10lnclist$ensembl_id) %>%
+    mutate(SYMBOL = ifelse(is.na(SYMBOL), ensembl_id, SYMBOL),
+           direction = ifelse(`pipeline-transcriptome-de_log2FC` > 1, 'up', 'down'),
+           expression = (expression - mean(expression))/sd(expression)) %>%
+    filter(!is.na(direction)) %>%
+  ggplot(aes(x = time, 
+             y = expression, 
+             color = SYMBOL,
+             fill = SYMBOL, 
+             linewidth = `pipeline-transcriptome-de_p-value`,
+             shape = direction,
+             size = `pipeline-transcriptome-de_p-value`,
+             group = SYMBOL)) +
+  geom_line() +
+  geom_point() +
+  #scale_color_gradientn(colors = c("darkcyan", "white", "darkred")) +
+  #scale_fill_gradient(low = "darkcyan", high = "darkred") +
+  scale_linewidth_continuous(range = c(0.8, 0.001)) +
+  scale_size_continuous(range = c(3, 1)) +
+  scale_shape_manual(values = c("up" = 24, "down" = 25), guide='none') +
+  labs(title = NULL,
+       x = NULL,
+       y = plot_title) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 12),
+    axis.title.x = element_text(size = 14),
+    axis.title.y = element_text(size = 14),
+    plot.title = element_text(size = 16, hjust = 0.5),
+    legend.position = "right",
+    legend.text = element_text(size = 10), # Adjust font size
+    legend.title = element_text(size = 12)# Center and adjust the title size
+  ) +
+  geom_vline(aes(xintercept = 3.5), linetype = "dashed", color = "gray50") +
+  facet_wrap(~ direction, scales = "fixed", nrow = 1) +
+  guides(linewidth = guide_legend(override.aes = list(size = 1))) +
+  ylim(y_limits) +
+  labs(
+    color = "Gene ID",
+    fill = "Gene ID",
+    size = NULL,
+    linewidth = NULL)
+  
+  return(p)
+}
+
+
+# facet_feature_plot <- function(timeseries, top10lists){
+#   
+#   sapply(top10lists,) +
+#     facet_wrap(~ comparison, scales = "fixed", nrow = 1)
+# }
+
+# top_genes_plot(timeseries, wb_delnc_combined, "Expression of DE lncRNAs across time (overall)")
+y_limits <- c(-1,3)
+
+plot_short <- top_genes_plot(timeseries, top10list_short_term, 
+               "short term", #Expression of DE lncRNAs across time (short term, preVSr+1)",
+               y_limits) +
+labs(title = "Expression of DE lncRNAs across time")
+plot_avg <- top_genes_plot(timeseries, top10list_average, 
+               "average", #Expression of DE lncRNAs across time (overall, preVSpost)",
+               y_limits)
+plot_long <- top_genes_plot(timeseries, top10list_long_term, 
+               "long term", #Expression of DE lncRNAs across time (long_term, preVSr+82)",
+               y_limits)
+
+combined_plot <- plot_short / plot_avg / plot_long
+
+combined_plot +
+  labs(size = "P-Value", linewidth = "P-Value")
+
+ggsave("feature_counts_plot.pdf", plot = combined_plot, width = 15, height = 15)#, dpi = 100)
+
+```
+
+# Comparisons and Intersections
+
+## Bisserier 27 list
+
+Superimpose the profiles of the 27-gene panel found by Bisserier et al.
+with the SpaceX I4 sequencing results.\
+Poor performance due to failure to map the Bisserier IDs to Ensembl IDs.
+
+```{r}
+bisserier_lnc <- tibble(
+  SYMBOL = sub("\\..*", "", readLines("bisserier_lncrnas.txt")),
+  ensembl_id = mapIds(
+      org.Hs.eg.db,
+      keys = SYMBOL,
+      column = "ENSEMBL", 
+      keytype = "SYMBOL", 
+      multiVals = "first"))
+
+# gene_mapping <- gene_mapping <- getBM(attributes = c('ensembl_gene_id', 'hgnc_symbol'),
+#                       filters = 'hgnc_symbol',
+#                       values = bisserier_lnc$SYMBOL,
+#                       mart=ensembl)
+# 
+# sum(is.na(bisserier_lnc$ensembl_id))
+# gene_mapping
+```
+
+Plotting the normalized count levels of the putative panel.
+
+```{r}
+timeseries %>% 
+  filter(SYMBOL %in% bisserier_lnc$SYMBOL | ensembl_id %in% bisserier_lnc$ensembl_id) %>%
+  mutate(expression = (expression - mean(expression))/sd(expression),
+         SYMBOL = ifelse(!is.na(SYMBOL), SYMBOL, ensembl_id)) %>%
+  ggplot(aes(
+    time,
+    expression,
+    group=SYMBOL,
+    color=SYMBOL)) +
+  geom_line() +
+  geom_point() +
+  labs(title="Whole Blood expression of Bisserier et al. biomarkers",
+       y = "Standardized Feature Counts",
+       x = NULL,
+       color = "Gene Symbol")
+```
+
+Check the most expressed lncRNA in the putative panel of biomarkers
+identified previously by Bisserier et al, only to find it not
+significantly deregulated.
+
+```{r}
+wb_average %>%
+  filter(ensembl_id %in% bisserier_lnc$ensembl_id)
+```
+
+## EV Differentially Expressed
+
+Retrieve DESeq2 results generated from OSD-571 cfRNA data with gene
+SYMBOL mapping
+
+Specs: ["R" is the numerator, and "L" is the denominator in the ratio
+used for Log2FC: Log2FC \> 0: Gene expression is higher in "R" compared
+to "L". Log2FC \< 0: Gene expression is higher in "L" compared to "R".]
+
+```{r, message=F}
+ev_deseq <- read_tsv("lncRNAs_571_averVSaver_symbols.tsv") %>%
+  dplyr::select(-1)
+
+evdeseq_pval01 <- ev_deseq %>%
+  filter(pvalue<0.1) %>%
+  dplyr::select('ensembl_id', 'log2FoldChange', 'pvalue') %>%
+  distinct()
+colnames(evdeseq_pval01) <- c('ensembl_id', 'ev_log2FC', 'ev_pval')
+
+wb_average_pval01 <- wb_average_lnc %>%
+  filter(`pipeline-transcriptome-de_p-value`<0.1) %>%
+  dplyr::select(1,starts_with('pipeline')) %>%
+  dplyr::select(-ncol(.)) %>%
+  distinct()
+colnames(wb_average_pval01) <- c('ensembl_id', 'wb_log2FC', 'wb_pval')
+
+osd_combined <- dplyr::inner_join(evdeseq_pval01,
+           wb_average_pval01) %>%
+  pivot_longer(cols = c(ev_log2FC, wb_log2FC), 
+               names_to = "Condition", 
+               values_to = "log2FC")
+```
+
+Plot the fold change of DE lncRNAs in the averageVSaverage comparison
+for the ones that appear significantly deregulated both in OSD-569
+Wholeblood sequencing experiment and in the OSD-571 exosomal cfRNA
+experiment. Note
+
+```{r}
+osd_combined %>%
+ggplot(aes(reorder(ensembl_id, log2FC), y = log2FC, fill = Condition)) +
+  geom_bar(stat = "identity", position = "dodge", orientation = 'vertical') +
+  labs(
+    x = "Ensembl ID",
+    y = "Log2 Fold Change",
+    title = "cfRNA vs Wholeblood Comparison (Average)"
+  ) +
+  coord_flip() +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+osd_combined_concorde <- pivot_wider(osd_combined,
+    names_from = Condition, 
+    values_from = log2FC) %>%
+  mutate(
+    SYMBOL = mapIds(
+      org.Hs.eg.db, 
+      keys = ensembl_id,
+      column = "SYMBOL", 
+      keytype = "ENSEMBL", 
+      multiVals = "first")) %>%
+  mutate(SYMBOL = ifelse(is.na(SYMBOL), ensembl_id, SYMBOL)) %>%
+  filter(ev_log2FC*wb_log2FC > 0) %>%
+  pivot_longer(cols = c(ev_log2FC, wb_log2FC), 
+               names_to = "Condition", 
+               values_to = "log2FC") 
+
+osdplot <- osd_combined_concorde %>%
+  ggplot(aes(
+    x = reorder(SYMBOL, log2FC), 
+    y = log2FC, 
+    fill = Condition)) +
+  geom_bar(stat = "identity", position = "dodge", orientation = 'vertical') +
+  labs(
+    x = "Gene ID",
+    y = "Log2 Fold Change",
+    fill = 'Experiment',
+    title = "Concorde DElncRNAs"
+  ) +
+  # scale_fill_manual(labels = c("Exosomal", "WholeBlood"), values = c("ev_log2FC", "wb_log2FC")) +
+  coord_flip() +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave(plot=osdplot, filename = "concorde_delncrnas.pdf", width = 10, height = 6)#, dpi = 100)
+```
+
+```{r}
+clipr::write_clip(bisserier_lnc$SYMBOL)
+```
+
+# Enrichment Analysis
+
+Filter for significative and DE genes, then enrich in common databases
+(KEGG) and plot the enriched terms.
+
+```{r enrichment_analysis_gpt}
+gene_entrez <- wb_short_term_lnc %>%
+  filter(`pipeline-transcriptome-de_p-value` < 0.5,  # Use a more reasonable threshold
+         `pipeline-transcriptome-de_log2FC` >= 1) %>%
+  pull(ensembl_id) %>%
+  bitr(fromType = "ENSEMBL", 
+       toType = "ENTREZID", 
+       OrgDb = org.Hs.eg.db, 
+       drop = TRUE)
+
+kegg_results <- enrichKEGG(
+  gene = gene_entrez$ENTREZID,
+  organism = 'hsa',
+  minGSSize = 1
+)
+
+if (!is.null(kegg_results) && nrow(kegg_results) > 0) {
+  dotplot(kegg_results)
+} else {
+  message("No significant KEGG enrichment found.")
+}
+```
+
+## lncRNA Target Retrieval
+
+Loading a master list of lncRNAs coupled with their RNA targets from
+multiple sources:
+
+-   lnc2Target [Pingping Wang, Hongxin Liu, Liang Cheng, Wenyang Zhou,
+    Xiyun Jin, Zhaochun Xu, Meng Luo, Liran Juan, and Qinghua Jiang,
+    'Lncrna2target V3.0: A Comprehensive Database for Target Genes of
+    lncRNAs in Human and Mouse'. Submitted. Last update: Jun 22, 2021]
+
+-   LncTarD [Zhao H, Yin X, Xu H, Liu K, Liu W, Wang L, Zhang C, Bo L,
+    Lan X, Lin S, Feng K, Ning S, Zhang Y, Wang L. LncTarD 2.0: an
+    updated comprehensive database for experimentally-supported
+    functional lncRNA-target regulations in human diseases. Nucleic
+    Acids Res. 2023 Jan 6;51(D1):D199-D207. doi: 10.1093/nar/gkac984.
+    PMID: 36321659; PMCID: PMC9825480.]
+
+```{r lnc_list_loading}
+lncRNAfromLowThroughput <- read_excel("lncRNA_target_from_low_throughput_experiments.xlsx") %>%
+  filter(Species == 9606)
+LncTarD <- read_delim("../lnctard2.0/lnctard2.0.txt") %>%
+  as.tibble() %>%
+  dplyr::select(c("Regulator", 
+                  "RegulatorEnsembleID", 
+                  "RegulatorEntrezID", 
+                  "Target", 
+                  "TargetEnsembleID", 
+                  "TargetEntrezID", 
+                  "TargetType", 
+                  "DiseaseName"))
+  
+
+lnc2target <- bind_rows(dplyr::select(LncTarD, c('ensembl_id' = 'RegulatorEnsembleID',
+                                                 'target_entrez_id' = 'TargetEntrezID',
+                                                 'target_official_symbol' = 'Target')),
+                        dplyr::select(lncRNAfromLowThroughput, c('ensembl_id' = 'Ensembl_ID', 
+                                                                 'target_entrez_id' = 'Target_entrez_gene_ID',
+                                                                 'target_official_symbol' = 'Target_official_symbol',
+                                                                 )))
+
+rm(lncRNAfromLowThroughput, LncTarD)
+lnc2target
+
+#write_csv(lnc2target, "lnc2target.csv")
+```
+
+Retrieving targets of the whole list of deregulated lncRNAs for each
+comparison (wb)
+
+```{r target_retrieval}
+
+retrieve_targets <- function(lnc2target, lnc_list){
+  
+  lnc_up <- lnc_list %>% 
+    filter(`pipeline-transcriptome-de_log2FC` > 1 & `pipeline-transcriptome-de_p-value`<0.1) %>%
+    pull(., ensembl_id)
+
+  lnc_down <- lnc_list  %>% 
+    filter(`pipeline-transcriptome-de_log2FC` < -1 & `pipeline-transcriptome-de_p-value`<0.1) %>%
+    pull(., ensembl_id)
+
+  targets_up <- filter(lnc2target,
+         `ensembl_id` %in% lnc_up) %>%
+          cbind(direction = 'up')# %>%
+    # distinct() %>%
+    # as.character()
+    # .[!is.na(.) & . != "0"]    
+  
+  targets_down <- filter(lnc2target,
+         `ensembl_id` %in% lnc_down) %>%
+          cbind(direction = 'down')
+    # distinct() %>%
+    # as.character()
+    # .[!is.na(.) & . != "0"]
+  
+  # perchè li stiamo dividendo
+  
+  targets <- rbind(targets_up,targets_down)
+  
+  return(targets)
+}
+
+targets_short_term <- retrieve_targets(lnc2target, wb_short_term_lnc)
+targets_average <- retrieve_targets(lnc2target, wb_average_lnc)
+targets_long_term <- retrieve_targets(lnc2target, wb_long_term_lnc)
+```
+
+Retrieve targets of the top 10 deregulated lncRNAs (5 most upregulated,
+5 most downregulated. pval \< 0.1)
+
+```{r top10_target_retrieval, eval=F, include=F}
+
+retrieve_targets <- function(lnc2target, lnc_list, wb, n){
+  
+  lnc_up <- top_2n_list(wb, lnc_list, n) %>%
+    filter(direction == 'up') %>%
+    pull(ensembl_id)
+  
+  lnc_down <- top_2n_list(wb, lnc_list, n) %>%
+    filter(direction == 'down') %>%
+    pull(ensembl_id)
+
+  targets_up <- filter(lnc2target,
+         `ensembl_id` %in% lnc_up) %>%
+          cbind(direction = 'up')# %>%
+    # distinct() %>%
+    # as.character()
+    # .[!is.na(.) & . != "0"]    
+  
+  targets_down <- filter(lnc2target,
+         `ensembl_id` %in% lnc_down) %>%
+          cbind(direction = 'down')
+    # distinct() %>%
+    # as.character()
+    # .[!is.na(.) & . != "0"]
+
+  targets <- rbind(targets_up,targets_down)
+  
+  return(targets)
+}
+
+targets_short_term <- retrieve_targets(lnc2target, wb_short_term_lnc, wb_short_term, 5)
+targets_average <- retrieve_targets(lnc2target, wb_average_lnc, wb_average, 5)
+targets_long_term <- retrieve_targets(lnc2target, wb_long_term_lnc, wb_long_term, 5)
+```
+
+Performing enrichment analysis for different ontologies, pathways and
+gene sets starting from the DE lncRNA targets.
+
+### KEGG pathways
+
+Checking KEGG pathway enrichment:
+
+```{r kegg_target_enrichment, eval=T}
+
+kegg_full_enrichment <- function(targets, title){
+  
+  limits = c(0,0.7)
+    
+  
+  targets_up <- targets %>%
+    filter(direction == 'up') %>%
+    pull(target_entrez_id)
+  
+  targets_down <- targets %>%
+    filter(direction == 'down') %>%
+    pull(target_entrez_id)
+  
+  kegg_results <- enrichKEGG(
+    gene = targets_up,
+    organism = 'hsa',
+    minGSSize = 1
+  )
+  
+  if (!is.null(kegg_results) && nrow(kegg_results) > 0) {
+    up <- dotplot(kegg_results) +
+      xlim(limits)
+      labs(title = sprintf("%s DE lncRNA upregulated targets", title))
+    # show(up)
+  } else {
+    message("No significant KEGG enrichment found.")
+  }
+  
+  kegg_results <- enrichKEGG(
+    gene = targets_down,
+    organism = 'hsa',
+    minGSSize = 1
+  )
+  
+  # Step 3: Plot results if enrichment is significant
+  if (!is.null(kegg_results) && nrow(kegg_results) > 0) {
+    down <- dotplot(kegg_results) +
+      xlim(limits) +
+      labs(title = sprintf("%s DE lncRNA downregulated targets", title))
+    
+    # show(down)
+  } else {
+    message("No significant KEGG enrichment found.")
+  }
+  
+  combined <- up + down
+  
+  return(combined)
+}
+
+kegg_results_short_term <- kegg_full_enrichment(targets_short_term, 'Short term')
+kegg_results_average <- kegg_full_enrichment(targets_average, 'Average')
+kegg_results_long_term <- kegg_full_enrichment(targets_long_term, 'Long term')
+
+kegg_results_set <- kegg_results_short_term / kegg_results_average / kegg_results_long_term +
+  plot_layout(guides = "collect") +
+  theme(legend.position = "bottom")
+
+# kegg_results_set
+# ggsave(filename = "KEGG_enrichment_combined_plots.png", plot = kegg_results_set, height = 10, width = 20)
+  
+```
+
+### Gene Ontology
+
+Checking enrichment from the Gene Ontology (all three BP, MF, CC):
+
+```{r go_target_enrichment, eval=T}
+go_full_enrichment <- function(targets, spec){
+  
+  limits = c(0,0.5)
+  
+
+  targets_up <- targets %>%
+    filter(direction == 'up') %>%
+    pull(target_entrez_id)
+  
+  targets_down <- targets %>%
+    filter(direction == 'down') %>%
+    pull(target_entrez_id)
+    
+  GO_results <- enrichGO(
+    gene = targets_up,
+    OrgDb = org.Hs.eg.db, ont = "ALL",
+    minGSSize = 1
+  )
+  
+  if (!is.null(GO_results) && nrow(GO_results) > 0) {
+    up <- dotplot(GO_results) +
+      xlim(limits) +
+      labs(title = sprintf("%s DE lncRNA upregulated targets", spec))
+    # show(p)
+  } else {
+    message("No significant enrichment found.")
+  }
+  
+  GO_results <- enrichGO(
+    gene = targets_down,
+    OrgDb = org.Hs.eg.db, ont = "ALL",
+    minGSSize = 1
+  )
+  
+  if (!is.null(GO_results) && nrow(GO_results) > 0) {
+    down <- dotplot(GO_results) +
+      xlim(limits) +
+      labs(title = sprintf("%s DE lncRNA downregulated targets", spec))
+    # show(p)
+  } else {
+    message("No significant enrichment found.")
+  }
+  
+  combined <- up + down
+  return(combined)
+}
+
+go_results_short_term <- go_full_enrichment(targets_short_term, 'Short term')
+go_results_average <- go_full_enrichment(targets_average, 'Average')
+go_results_long_term <- go_full_enrichment(targets_long_term, 'Long term')
+
+goresultscombined <- go_results_short_term / go_results_average / go_results_long_term +
+  plot_layout(guides = "collect") +
+  theme(legend.position = "bottom")
+
+# goresultscombined
+# ggsave(filename = "GO_enrichment_combined_plots.png", plot = goresultscombined, height = 15, width = 20)
+```
+
+
+WGCNA assessment of driver genes overlapping with significantly DE lncRNAs
+```{r}
+drivers_symbols <- c("WAC-AS1", 
+                     "RP11-35G9", 
+                     "TRG-AS1")
+drivers <- c("ENSG00000254635",
+             "ENSG00000267040",
+             "ENSG00000281103")
+
+filter(wb_average_lnc, ensembl_id %in% drivers)
+filter(wb_short_term_lnc, ensembl_id %in% drivers)
+filter(wb_long_term_lnc, ensembl_id %in% drivers)
+```
