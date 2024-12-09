@@ -1,0 +1,379 @@
+---
+title: "deseq_571"
+output: html_document
+date: "2024-12-05"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# preprocessing to obtain counts and conditions
+```{r}
+library(tidyverse)
+
+file_path <- "osdr571.csv"
+data <- read.csv(file_path, sep = ";", check.names = FALSE)
+
+# data <- data %>% select(-`Unnamed: 26`)
+rownames(data) <- data$`Unnamed: 0`
+# data <- data %>% select(-`Unnamed: 0`)
+
+l_samples <- colnames(data)[grepl("_L", colnames(data))]
+r_samples <- colnames(data)[grepl("_R", colnames(data))]
+
+counts_matrix <- data[, c(l_samples, r_samples)]
+
+sample_conditions <- data.frame(
+  sample = c(l_samples, r_samples),
+  condition = c(rep("L", length(l_samples)), rep("R", length(r_samples)))
+)
+write.csv(counts_matrix, "counts_matrix.csv", row.names = TRUE)
+write.csv(sample_conditions, "sample_conditions.csv", row.names = FALSE)
+```
+
+# load packages and needed data
+```{r}
+library(DESeq2)
+
+count_data <- read.csv("counts_matrix.csv", row.names = 1)
+sample_data <- read.csv("sample_conditions.csv", row.names = 1)
+```
+
+# create dds object
+```{r message=FALSE, warning=FALSE}
+dds <- DESeqDataSetFromMatrix(
+    countData = count_data,
+    colData = sample_data,
+    design = ~ condition
+)
+```
+
+# run dds and extract the results
+```{r}
+dds <- DESeq(dds)
+```
+
+
+```{r}
+results <- results(dds, contrast = c("condition", "R", "L"))
+
+head(results)
+write.csv(as.data.frame(results), file = "deseq571_results.csv")
+
+```
+
+# plot the results
+```{r}
+plotMA(results, ylim = c(-2, 2))
+DESeq2::plotPCA(vst(dds))
+
+library(ggplot2)
+results <- read.csv("deseq571_results.csv", row.names = 1)
+log2fc_threshold <- 1
+pval_threshold <- 0.05
+
+results$significant <- ifelse(
+  results$padj < pval_threshold & abs(results$log2FoldChange) > log2fc_threshold,
+  "Significant", "Not Significant"
+)
+
+results$direction <- ifelse(
+  results$significant == "Significant" & results$log2FoldChange > 0, "Upregulated",
+  ifelse(results$significant == "Significant" & results$log2FoldChange < 0, "Downregulated", "Not Significant")
+)
+
+ggplot(results, aes(x = log2FoldChange, y = -log10(pvalue), color = direction)) +
+  geom_point(alpha = 0.8, size = 2) +
+  scale_color_manual(values = c("Upregulated" = "red", "Downregulated" = "blue", "Not Significant" = "gray")) +
+  theme_minimal() +
+  labs(
+    title = "Volcano Plot",
+    x = "Log2 Fold Change",
+    y = "-Log10 P-value",
+    color = "Gene"
+  ) +
+  theme(legend.position = "top")
+```
+
+# assign the genes name to the results
+```{r}
+osdr571 <- read.csv("osdr571.csv", header = TRUE, row.names = 1)
+deseq_results <- read.csv("deseq571_results.csv", header = TRUE)
+
+if (nrow(deseq_results) == nrow(osdr571)) {
+     rownames(deseq_results) <- rownames(osdr571)
+     write.csv(deseq_results, "deseq571_results_with_genes.csv", row.names = TRUE)
+     head(deseq_results)
+ } else {
+    cat("Warning: The number of rows in the two files do not match.\n")
+   }
+```
+
+# bit of post-processing to obtain final file
+```{r}
+deseq_results <- read.csv("deseq571_results_with_genes.csv", header = TRUE, row.names = 1)
+
+deseq_results <- deseq_results %>% dplyr::select(-X)
+
+cleaned_rownames <- sub("\\..*", "", rownames(deseq_results))
+cleaned_rownames <- make.unique(cleaned_rownames)
+rownames(deseq_results) <- cleaned_rownames
+
+write.csv(deseq_results, "deseq571_results_averageVSaverage.csv", row.names = TRUE)
+
+head(deseq_results)
+```
+# check for lncrnas
+```{r}
+linclist <- read.delim("linclist.tsv", header = T)
+lncRNAs <- deseq_results %>%
+  dplyr::filter(rownames(deseq_results) %in% linclist$ensemblGeneID)
+```
+
+# make a volcano to visualize expression of DE lncrnas (average vs average)
+```{r}
+ggplot(lncRNAs, aes(x = log2FoldChange, y = -log10(pvalue))) +
+  geom_point(aes(color = ifelse(padj < 0.05 & abs(log2FoldChange) > 1, 
+                                ifelse(log2FoldChange > 0, 'Upregulated', 'Downregulated'), 'Not Significant')),
+             alpha = 0.8, size = 2) +
+  scale_color_manual(values = c('Upregulated' = 'red', 'Downregulated' = 'blue', 'Not Significant' = 'gray')) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "black") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black") +
+  labs(title = "Volcano Plot for lncRNAs", 
+       x = "log2(Fold Change)", 
+       y = "-log10(P-value)",
+       color = "lncRNAs") +
+  theme_minimal() +
+  theme(legend.position = "top")
+```
+# extract the most significant lncrnas, up and down
+```{r}
+upregulated_lncRNAs <- lncRNAs %>%
+  filter(log2FoldChange > 1 & pvalue < 0.1) %>%
+  rownames()
+
+downregulated_lncRNAs <- lncRNAs %>%
+  filter(log2FoldChange < -1 & pvalue < 0.1) %>%
+  rownames()
+
+upregulated_pvals <- lncRNAs %>%
+  filter(rownames(lncRNAs) %in% upregulated_lncRNAs) %>%
+  pull(pvalue) %>%
+  sort()
+plot(upregulated_pvals, main = "Sorted p-values for Upregulated lncRNAs", 
+     xlab = "Gene Index", ylab = "p-value", type = "b", col = "red")
+
+downregulated_pvals <- lncRNAs %>%
+  filter(rownames(lncRNAs) %in% downregulated_lncRNAs) %>%
+  pull(pvalue) %>%
+  sort()
+plot(downregulated_pvals, main = "Sorted p-values for Downregulated lncRNAs", 
+     xlab = "Gene Index", ylab = "p-value", type = "b", col = "blue")
+```
+# filter the whole matrix, not only rownames... and save the results
+```{r}
+upregulated_lncRNAs_df <- lncRNAs %>%
+  filter(log2FoldChange > 1 & pvalue < 0.1) 
+
+downregulated_lncRNAs_df <- lncRNAs %>%
+  filter(log2FoldChange < -1 & pvalue < 0.1)
+
+filtered_lncRNAs_df <- bind_rows(upregulated_lncRNAs_df, downregulated_lncRNAs_df)
+write.table(filtered_lncRNAs_df, "lncRNAs_571_averVSaver.tsv", sep = "\t", quote = FALSE, row.names = TRUE)
+
+head(filtered_lncRNAs_df)
+```
+# add a gene symbol columnm
+```{r}
+library(biomaRt)
+
+ensembl <- useMart("ENSEMBL_MART_ENSEMBL", dataset = "hsapiens_gene_ensembl")
+
+gene_mapping <- getBM(attributes = c("ensembl_gene_id", "hgnc_symbol"),
+                      filters = "ensembl_gene_id",
+                      values = rownames(filtered_lncRNAs_df), 
+                      mart = ensembl)
+
+filtered_lncRNAs_with_symbols <- merge(filtered_lncRNAs_df, gene_mapping, 
+                                       by.x = "row.names", by.y = "ensembl_gene_id", 
+                                       all.x = TRUE)
+
+filtered_lncRNAs_with_symbols$gene_symbol <- filtered_lncRNAs_with_symbols$hgnc_symbol
+
+head(filtered_lncRNAs_with_symbols)
+
+write.table(filtered_lncRNAs_with_symbols, "lncRNAs_571_averVSaver_symbols.tsv", sep = "\t", quote = FALSE, row.names = TRUE)
+```
+# retrieve the targets of the lncRNAs
+```{r}
+top10list <- read.csv("top10list_average.csv", row.names = 1, stringsAsFactors = FALSE)
+lnc2target <- read.csv("lnc2target.csv", stringsAsFactors = FALSE)
+
+matched_targets <- lnc2target %>%
+  filter(Ensembl_ID %in% rownames(top10list))
+
+result <- matched_targets %>%
+  dplyr::select(Ensembl_ID, Target_entrez_gene_ID)
+
+# write.table(result, "matched_targets.tsv", sep = "\t", quote = FALSE, row.names = FALSE)
+
+head(result)
+
+```
+# plotting the results obtained on disgenet inserting the most 10 de lncrnas,
+# 5 up and 5 down. qui fatto solo per average, da fare per gli altri.
+```{r}
+data <- read.delim("average_disgenet.tsv", sep = "\t")
+
+
+data <- data %>%
+  mutate(GeneList = strsplit(as.character(Gene), ",")) %>%
+  unnest(GeneList) %>%
+  distinct(Disease, GeneList) %>%
+  group_by(Disease) %>%
+  summarise(GeneCount = n())  
+
+disease_gene_counts <- data %>%
+  arrange(-GeneCount)
+
+ggplot(disease_gene_counts, aes(x = GeneCount, y = reorder(Disease, GeneCount))) +
+  geom_bar(stat = "identity", fill = "darkred") +
+  labs(
+    #title = "lncRNAs-Diseases associations",
+    x = "Number of lncRNAs",
+    y = "Disease"
+  ) +
+  scale_x_continuous(
+    limits = c(0, 3),             
+    breaks = seq(0, 3, by = 1)     
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(size = 10),
+    axis.text.y = element_text(size = 10),
+    #plot.title = element_text(hjust = 0.01)
+  ) 
+```
+
+# doing the same for long term
+# qua da notare che sono in grado di recuperare alcuni targets dei most DE lncrna longterm!!!
+# cosa che non era stata possibile per average :/
+```{r}
+top10list <- read.csv("top10list_long_term.csv", row.names = 1, stringsAsFactors = FALSE)
+lnc2target <- read.csv("lnc2target.csv", stringsAsFactors = FALSE)
+
+matched_targets <- lnc2target %>%
+  filter(Ensembl_ID %in% rownames(top10list))
+
+result <- matched_targets %>%
+  dplyr::select(Ensembl_ID, Target_entrez_gene_ID)
+
+# write.table(result, "matched_targets.tsv", sep = "\t", quote = FALSE, row.names = FALSE)
+
+head(matched_targets)
+```
+
+# plotting the results obtained on disgenet inserting the most 10 de lncrnas,
+# 5 up and 5 down. qui fatto solo per long term.
+```{r}
+data <- read.delim("long_term_disgenet.tsv", sep = "\t")
+
+data <- data %>%
+  mutate(GeneList = strsplit(as.character(Gene), ",")) %>%
+  unnest(GeneList) %>%
+  distinct(Disease, GeneList) %>%
+  group_by(Disease) %>%
+  summarise(GeneCount = n())  
+
+disease_gene_counts <- data %>%
+  arrange(-GeneCount)
+
+ggplot(disease_gene_counts, aes(x = GeneCount, y = reorder(Disease, GeneCount))) +
+  geom_bar(stat = "identity", fill = "darkred") +
+  labs(
+    #title = "lncRNAs-Diseases associations",
+    x = "Number of lncRNAs",
+    y = "Disease"
+  ) +
+  scale_x_continuous(
+    limits = c(0, 2),             
+    breaks = seq(0, 2, by = 1)     
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(size = 10),
+    axis.text.y = element_text(size = 10),
+    #plot.title = element_text(hjust = 0.01)
+  )
+```
+
+# doing the same for short term
+# qua da notare che NON sono in grado di recuperare alcuni targets dei most DE lncrna longterm 
+# cosa uguale ad average :/
+```{r}
+top10list <- read.csv("top10list_short_term.csv", row.names = 1, stringsAsFactors = FALSE)
+lnc2target <- read.csv("lnc2target.csv", stringsAsFactors = FALSE)
+
+matched_targets <- lnc2target %>%
+  filter(Ensembl_ID %in% rownames(top10list))
+
+result <- matched_targets %>%
+  dplyr::select(Ensembl_ID, Target_entrez_gene_ID)
+
+# write.table(result, "matched_targets.tsv", sep = "\t", quote = FALSE, row.names = FALSE)
+
+head(matched_targets)
+```
+
+# plotting the results obtained on disgenet inserting the most 10 de lncrnas,
+# 5 up and 5 down. qui fatto solo per short term.
+```{r}
+data <- read.delim("short_term_disgenet.tsv", sep = "\t")
+
+data <- data %>%
+  mutate(GeneList = strsplit(as.character(Gene), ",")) %>%
+  unnest(GeneList) %>%
+  distinct(Disease, GeneList) %>%
+  group_by(Disease) %>%
+  summarise(GeneCount = n())  
+
+disease_gene_counts <- data %>%
+  arrange(-GeneCount)
+
+ggplot(disease_gene_counts, aes(x = GeneCount, y = reorder(Disease, GeneCount))) +
+  geom_bar(stat = "identity", fill = "darkred") +
+  labs(
+    #title = "lncRNAs-Diseases associations",
+    x = "Number of lncRNAs",
+    y = "Disease"
+  ) +
+  scale_x_continuous(
+    limits = c(0, 3),             
+    breaks = seq(0, 3, by = 1)     
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(size = 10),
+    axis.text.y = element_text(size = 10),
+    #plot.title = element_text(hjust = 0.01)
+  )
+```
+# WCGNA analysis
+```{r}
+library(dplyr)
+
+pre_samples <- readLines("lista_pre.txt")
+post_samples <- readLines("lista_post.txt")
+pre_df <- data.frame(Sample = pre_samples, Group = "Pre", stringsAsFactors = FALSE)
+post_df <- data.frame(Sample = post_samples, Group = "Post", stringsAsFactors = FALSE)
+
+combined_df <- bind_rows(pre_df, post_df)
+
+write.csv(combined_df, "samples.csv", row.names = FALSE)
+
+df <- read.csv("wgcna.csv")
+linclist_genes <- linclist$ensemblGeneID
+filtered_df <- subset(df, gene %in% linclist_genes)
+write.csv(filtered_df, "wgcna_lncRNAs.csv", row.names = FALSE)
+```

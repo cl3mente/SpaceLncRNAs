@@ -1,0 +1,101 @@
+---
+title: "deseq_analysis_L-92vsL-2"
+output: html_document
+date: "2024-12-04"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# load needed packages 
+```{r setup, include=FALSE}
+library(DESeq2)
+library(readxl)
+library(ggplot2)
+```
+
+# load data
+```{r setup, include=FALSE}
+file_path <- "~/Desktop/deseq.xlsx"
+raw_data <- read_excel(file_path, sheet = "Foglio1")
+
+head(raw_data)
+```
+
+# cleaning of the data, obtaining only the raw counts and extraction of metadata
+```{r}
+library(tidyverse)
+gene_counts <- raw_data[9:nrow(raw_data), ]
+  
+colnames(gene_counts) <- as.character(raw_data[8, ])
+colnames(gene_counts)[1] <- "ENSEMBL"
+gene_counts <- gene_counts[-1, ] %>%
+  as.data.frame() %>%
+  distinct(ENSEMBL, .keep_all = TRUE) %>%
+  column_to_rownames(var = "ENSEMBL") %>%
+  mutate_all(as.numeric)
+
+metadata <- data.frame(
+    SampleID = as.character(raw_data[7, 2:ncol(raw_data)]),
+    Condition = as.character(raw_data[8, 2:ncol(raw_data)])
+)
+metadata <- metadata[!is.na(metadata$SampleID), ]
+
+```
+
+# create dds object
+```{r}
+dds <- DESeqDataSetFromMatrix(
+    countData = gene_counts,
+    colData = metadata,
+    design = ~ Condition
+)
+
+dds <- dds[rowSums(counts(dds)) >= 10, ]
+
+```
+# run dds
+```{r}
+dds <- DESeq(dds)
+res <- results(dds, contrast = c("Condition", "L-92", "L-3"))
+
+summary(res)
+res <- res[order(res$padj), ]
+```
+# plotting
+```{r}
+plotMA(res, ylim = c(-5, 5), main = "MA-Plot: L-92 vs L-3")
+
+
+res_df <- as.data.frame(res)
+res_df$Significant <- ifelse(res_df$padj < 0.05 & !is.na(res_df$padj), "Yes", "No")
+head(res_df)
+
+ggplot(res_df, aes(x = log2FoldChange, y = -log10(padj))) +
+  geom_point(aes(color = Significant), alpha = 0.6, size = 2) +
+  scale_color_manual(values = c("grey", "red")) + 
+  labs(
+    title = "Volcano Plot: L-92 vs L-3",
+    x = "Log2 Fold Change",
+    y = "-Log10 Adjusted P-value"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "top",
+    plot.title = element_text(hjust = 0.5)
+  )
+```
+# extract list of significant genes, to overlap with linclist
+```{r}
+linclist <- read_tsv("linclist.tsv", col_names = T)
+
+rownames(res_df) <- make.unique(sub("\\..*", "", rownames(res_df)))
+
+linclist_ensg <- linclist$ensemblGeneID
+filtered_res <- res_df[rownames(res_df) %in% linclist_ensg, ]
+head(filtered_res)
+
+write.csv(filtered_res, "deseq_results_prevspre.csv", row.names = TRUE)
+```
+
